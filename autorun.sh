@@ -1,5 +1,3 @@
-source /root/anaconda3/etc/profile.d/conda.sh
-conda activate jittor
 run_iterations=20000
 if [ "$1" != "" ]; then
     run_iterations="$1"
