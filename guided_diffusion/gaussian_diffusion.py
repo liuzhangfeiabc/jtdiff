@@ -208,7 +208,7 @@ class GaussianDiffusion():
                 (yield out)
                 img = out['sample']
 
-    def ddim_sample(self, model, x, t, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, eta=0.0):
+    def ddim_sample(self, model, x, t, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, eta=0.0, use_dpm_solver=False, dpm_solver_buffer=None):
         # print('halfa')
         out = self.p_mean_variance(model, x, t, clip_denoised=clip_denoised, denoised_fn=denoised_fn, model_kwargs=model_kwargs)
         # print('halfb...')
@@ -217,12 +217,44 @@ class GaussianDiffusion():
         eps = self._predict_eps_from_xstart(x, t, out['pred_xstart'])
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
         alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
-        sigma = ((eta * jt.sqrt(((1 - alpha_bar_prev) / (1 - alpha_bar)))) * jt.sqrt((1 - (alpha_bar / alpha_bar_prev))))
-        noise = jt.randn_like(x)
-        mean_pred = ((out['pred_xstart'] * jt.sqrt(alpha_bar_prev)) + (jt.sqrt(((1 - alpha_bar_prev) - (sigma ** 2))) * eps))
-        nonzero_mask = (t != 0).float().view(((- 1), *([1] * (len(x.shape) - 1))))
-        sample = (mean_pred + ((nonzero_mask * sigma) * noise))
-        return {'sample': sample, 'pred_xstart': out['pred_xstart']}
+        if use_dpm_solver == False:
+            sigma = ((eta * jt.sqrt(((1 - alpha_bar_prev) / (1 - alpha_bar)))) * jt.sqrt((1 - (alpha_bar / alpha_bar_prev))))
+            noise = jt.randn_like(x)
+            mean_pred = ((out['pred_xstart'] * jt.sqrt(alpha_bar_prev)) + (jt.sqrt(((1 - alpha_bar_prev) - (sigma ** 2))) * eps))
+            nonzero_mask = (t != 0).float().view(((- 1), *([1] * (len(x.shape) - 1))))
+            sample = (mean_pred + ((nonzero_mask * sigma) * noise))
+            current_buffer = None
+        else:
+            '''
+            use dpm-solver++2M
+            
+            s: timestep t
+            t: timestep t-1
+            lambda = log (alpha / sigma)
+            
+            '''
+            alpha_s = jt.sqrt(alpha_bar)
+            alpha_t = jt.sqrt(alpha_bar_prev)
+            sigma_s = jt.sqrt(1. - alpha_bar)
+            sigma_t = jt.sqrt(1. - alpha_bar_prev)
+            lambda_s = jt.log(alpha_s / sigma_s)
+            lambda_t = jt.log(alpha_t / sigma_t)
+            h = lambda_t - lambda_s
+            if dpm_solver_buffer is None:
+                d = out["pred_xstart"]
+            else:
+                r = dpm_solver_buffer["h"] / h
+                d = (1. + 0.5 / r) * out["pred_xstart"] -  0.5 / r * dpm_solver_buffer["pred_xstart"]
+
+            sample = sigma_t / sigma_s * x - alpha_t * (jt.exp(-h) - 1.) * d
+            for i in range(t.shape[0]):
+                if t[i] == 0:
+                    sample[i] = out["pred_xstart"][i]
+            current_buffer = {
+                "h": h,
+                "pred_xstart": out["pred_xstart"]
+            }
+        return {'sample': sample, 'pred_xstart': out['pred_xstart'], 'dpm_solver_buffer': current_buffer}
 
     def ddim_reverse_sample(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None, eta=0.0):
         assert (eta == 0.0), 'Reverse ODE only for deterministic path'
@@ -232,17 +264,17 @@ class GaussianDiffusion():
         mean_pred = ((out['pred_xstart'] * jt.sqrt(alpha_bar_next)) + (jt.sqrt((1 - alpha_bar_next)) * eps))
         return {'sample': mean_pred, 'pred_xstart': out['pred_xstart']}
 
-    def ddim_sample_loop(self, model, shape, noise=None, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, device=None, progress=False, eta=0.0):
+    def ddim_sample_loop(self, model, shape, noise=None, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, device=None, progress=False, eta=0.0, use_dpm_solver=False):
         final = None
         # final = self.ddim_sample_loop_progressive(model, shape, noise=noise, clip_denoised=clip_denoised, denoised_fn=denoised_fn, cond_fn=cond_fn, model_kwargs=model_kwargs, device=device, progress=progress, eta=eta)
-        for sample in self.ddim_sample_loop_progressive(model, shape, noise=noise, clip_denoised=clip_denoised, denoised_fn=denoised_fn, cond_fn=cond_fn, model_kwargs=model_kwargs, device=device, progress=progress, eta=eta):
+        for sample in self.ddim_sample_loop_progressive(model, shape, noise=noise, clip_denoised=clip_denoised, denoised_fn=denoised_fn, cond_fn=cond_fn, model_kwargs=model_kwargs, device=device, progress=progress, eta=eta, use_dpm_solver=use_dpm_solver):
             # print("begin2")
             final = sample
             jt.clean()
             # print("end2")
         return final['sample']
 
-    def ddim_sample_loop_progressive(self, model, shape, noise=None, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, device=None, progress=False, eta=0.0):
+    def ddim_sample_loop_progressive(self, model, shape, noise=None, clip_denoised=True, denoised_fn=None, cond_fn=None, model_kwargs=None, device=None, progress=False, eta=0.0, use_dpm_solver=False):
         # print("ddim_sample_loop_progressive")
         if (device is None):
             device = next(model.parameters()).device
@@ -255,13 +287,15 @@ class GaussianDiffusion():
         if progress:
             from tqdm.auto import tqdm
             indices = tqdm(indices)
+        dpm_solver_buffer=None
         for i in indices:
             t = jt.array(([i] * shape[0]))
             # print('loop_progressive...')
             with jt.no_grad():
-                out = self.ddim_sample(model, img, t, clip_denoised=clip_denoised, denoised_fn=denoised_fn, cond_fn=cond_fn, model_kwargs=model_kwargs, eta=eta)
+                out = self.ddim_sample(model, img, t, clip_denoised=clip_denoised, denoised_fn=denoised_fn, cond_fn=cond_fn, model_kwargs=model_kwargs, eta=eta, use_dpm_solver=use_dpm_solver, dpm_solver_buffer=dpm_solver_buffer)
                 yield out
                 img = out['sample']
+                dpm_solver_buffer = out['dpm_solver_buffer']
 
     def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):
         # "\n        Get a term for the variational lower-bound.\n\n        The resulting units are bits (rather than nats, as one might expect).\n        This allows for comparison to other papers.\n\n        :return: a dict with the following keys:\n                 - 'output': a shape [N] tensor of NLLs or KLs.\n                 - 'pred_xstart': the x_0 predictions.\n        "
