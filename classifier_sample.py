@@ -88,7 +88,7 @@ def main():
         classes = jt.randint(low=0, high=NUM_CLASSES, shape=(args.batch_size,))
         model_kwargs['y'] = classes
         sample_fn = (diffusion.p_sample_loop if (not args.use_ddim) else diffusion.ddim_sample_loop)
-        sample = sample_fn(model_fn, (args.batch_size, 3, args.image_size, args.image_size), clip_denoised=args.clip_denoised, model_kwargs=model_kwargs, cond_fn=cond_fn, device='cuda')
+        sample = sample_fn(model_fn, (args.batch_size, 3, args.image_size, args.image_size), clip_denoised=args.clip_denoised, model_kwargs=model_kwargs, cond_fn=cond_fn, device='cuda', use_dpm_solver=args.use_dpm_solver)
         # logger.log('now...')
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(jt.uint8)
         sample = sample.permute((0, 2, 3, 1))
@@ -115,7 +115,7 @@ def main():
     logger.log('sampling complete')
 
 def create_argparser():
-    defaults = dict(clip_denoised=True, num_samples=10000, batch_size=16, use_ddim=False, model_path='', classifier_path='', classifier_scale=1.0)
+    defaults = dict(clip_denoised=True, num_samples=10000, batch_size=16, use_ddim=False, model_path='', classifier_path='', classifier_scale=1.0, use_dpm_solver=False)
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())
     parser = argparse.ArgumentParser()
